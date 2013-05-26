@@ -1,0 +1,8 @@
+localhost slots=1
+agassiz slots=4
+bago slots=4
+conness slots=4
+darwin slots=4
+ericsson slots=4
+findome slots=4
+goddard slots=4
