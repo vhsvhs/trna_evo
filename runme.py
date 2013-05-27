@@ -448,6 +448,9 @@ def find_anticodon_switches():
     "\n. OK, I'm searching for switched anticodons."
     species_list = species_trna_seq.keys()
     species_list.sort()
+    allpath = DATADIR + "/all.acswitches.txt"
+    allout = open(allpath, "w")
+    allout.write("Species\testimated from\tto\tto ac\tto aa\td\n")
     for species in species_list:
         rpath = SUMMARYDIR + "/" + species + ".acswitches.txt"
         treepath = RAXMLDIR + "/RAxML_result." + species
@@ -498,16 +501,17 @@ def find_anticodon_switches():
                     thataa = get_aa_from_name(closest_diff)
                     if thataa  == myaa: # synonymous shift
                         species_scount[species] += 1
-                        fout.write("Synonymous" + " " + closest_diff + " -> " + t1.label + "\n")
-                        print "  . Syn." + " " + closest_diff + " -> " + t1.label
+                        fout.write("Synonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
+                        allout.write(species + "\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t" + min2diff.__str__() + "\n")                                     
+                        print "  . Syn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
                         if myac not in species_ac_scount[species]:
                             species_ac_scount[species][myac] = 1
                         else:
                             species_ac_scount[species][myac] += 1
-                    elif thataa != "Met": # nonsynonymous shift
+                    elif thataa != myaa and thataa != "Met": # nonsynonymous shift
                         species_nscount[species] += 1
-                        fout.write("Nonsynonymous" + " " + closest_diff + " -> " + t1.label + "\n")
-                        print "  . Nonsyn." + " " + closest_diff + " -> " + t1.label
+                        fout.write("Nonsynonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
+                        print "  . Nonsyn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
                         if myac not in species_ac_nscount[species]:
                             species_ac_nscount[species][myac] = 1
                         else:
@@ -520,6 +524,7 @@ def find_anticodon_switches():
             print ".", species, "has", species_scount[species], "putative synonymously switched anticodons."        
         else:
             print ". I skipped species", species, "because I can't find the ML tree."
+    allout.close()
 
 
 def write_summaries():
@@ -547,7 +552,7 @@ def write_summaries():
 
         # N rejected
         if species in species_countreject:
-            line += species_countreject[species].__len__().__str__() + "\t"
+            line += species_countreject[species].__str__() + "\t"
         else:
             line += "None\t"
         
