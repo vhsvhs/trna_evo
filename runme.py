@@ -68,6 +68,7 @@
 #
 LOGDIR = "LOGS"
 DATADIR = "DATA"         # All output data will be written to this folder.
+TEMPDIR = "TEMP"
 SEQDIR = DATADIR + "/raw_sequences"
 RAXMLDIR = DATADIR + "/raxml_output"
 TREEDIR = DATADIR + "/trees"
@@ -75,7 +76,7 @@ STRUCTDIR = DATADIR + "/tRNAscan_output"
 MSADIR = DATADIR + "/alignments"
 SUMMARYDIR = DATADIR + "/summaries"
 
-ALLDIRS = [LOGDIR, DATADIR, SEQDIR, RAXMLDIR, TREEDIR, STRUCTDIR, MSADIR, SUMMARYDIR]
+ALLDIRS = [LOGDIR, DATADIR, TEMPDIR, SEQDIR, RAXMLDIR, TREEDIR, STRUCTDIR, MSADIR, SUMMARYDIR]
 
 TRNASCAN = "trnascan-SE" # Points to the executable: http://selab.janelia.org/tRNAscan-SE/
 PSUEDOGENE_CUTOFF = 40
@@ -92,6 +93,7 @@ MPIDISPATCH = "/common/bin/mpi_dispatch"
 # You shouldn't need to modify anything below here. . . 
 #
 import os, sys, re
+import cPickle as pickle
 from dendropy import Tree, treecalc
 
 #
@@ -101,22 +103,32 @@ from dendropy import Tree, treecalc
 
 #
 species_trna_seq = {} # key = species, value = hashtable: key = tRNA name, value = tRNA sequence (cleaned, with anti-codon changed to NNN).  This hashtable contains only unique sequences; redundant sequences are discarded rather than added to this hashtable.
-
 species_alltrnanames = {} # key = species, value = list of all tRNA names in the databse for this species.  Note that some tRNAs will not be in species_trna_seq because their sequences are redundant. 
-
 species_trna_dups = {} # [species][trna name] = a list of other tRNA names that have identical sequences to this tRNA.
-species_countreject = {}
-
-
+species_countreject = {} # key = species, value = count of rejected tRNAs from database.
 species_nscount = {} # key = species, value = count of putative nonsynonymous anticodon-switching events.
 species_scount = {} # key = species, value = count of putative synonymous anticodon-switching events.
-
 species_ac_nscount = {} # key = species, value = hash; key = codon, value = count of anticodon shifts to this codon
 species_ac_scount = {} # same as species_ac_nscount, but count nonsynonymous anticodon shifts only.
-
 ac_count = {} # key = anticodon, value = count of tRNAs among all species.
 
 ##################################
+
+def pickle_globals():
+    p = [species_trna_seq, species_alltrnanames, species_trna_dups, species_countreject, species_nscount, species_scount, species_ac_nscount, species_ac_scount, ac_count]
+    pickle.dump( p, open( TEMPDIR + "/save.p", "w" ) )
+    
+def unpickle_globals():
+    p = pickle.load( open( TEMPDIR + "/save.p", "r" ) )
+    species_trna_seq = p[0]
+    species_alltrnanames = p[1]
+    species_trna_dups = p[2]
+    species_countreject = p[3]
+    species_nscount = p[4]
+    species_scount = p[5]
+    species_ac_nscount = p[6]
+    species_ac_scount = p[7]
+    ac_count = p[8]
 
 def remove_problem_chars(x):
     #print x
@@ -444,14 +456,43 @@ def debug411(species):
     print "491: verify: ns =", countns, "s=", counts, "sum=", (countns + counts)
     # end debugging
 
+def asses_monophyly(t):
+    """t is a DendroPy Tree."""
+    """This function returns a hashtable, where key = anticodon preference X,
+    value = the number of tRNAs with a.c. other than X that must be invoked to make
+    the X clade monophyletic. """
+    
+    t.is_rooted = False
+    t.update_splits()
+    
+    # First, sort the leaf nodes by their anticodon preference.
+    ac_labels = {} # key = a.c., value = list of Node objects
+    for i, t1 in enumerate(t.taxon_set):
+        thisac = get_ac_from_name( t1.label )
+        if thisac not in ac_labels:
+            ac_labels[ thisac ] = []
+        ac_labels[ thisac ].append( t1.label )
+    
+    # Next, find the MRCA for each set of a.c. nodes
+    for ac in ac_labels:
+        mrca = t.mrca(taxon_labels=ac_labels[ac])
+        print ac, mrca
+
+    # to-do: count the number of nodes descendant from mrsa.
+
 def find_anticodon_switches():
-    "\n. OK, I'm searching for switched anticodons."
+    print "\n. OK, I'm searching for switched anticodons. . ."
     species_list = species_trna_seq.keys()
     species_list.sort()
+    #print "504:", species_list
     allpath = DATADIR + "/all.acswitches.txt"
     allout = open(allpath, "w")
-    allout.write("Species\testimated from\tto\tto ac\tto aa\td\n")
+    allout.write("Species\tswitch type\testimated from\tto\tto ac\tto aa\td\n")
+    #
+    # FOR EACH SPECIES. . . 
+    #
     for species in species_list:
+        print species
         rpath = SUMMARYDIR + "/" + species + ".acswitches.txt"
         treepath = RAXMLDIR + "/RAxML_result." + species
         if os.path.exists(treepath):
@@ -465,11 +506,15 @@ def find_anticodon_switches():
             print "\n. Calculating all pairwise distances between sequences on tree:", treepath
             pdm = treecalc.PatristicDistanceMatrix(t) # matrix of pairwise distances between taxa
             
+            asses_monophyly(t)
+            
+            #
+            # FOR EACH tRNA SEQUENCE. . .
             # Goal: for each tRNA find the min. distance to another tRNA with the same
             # anticodon, then find the min. distance to another tRNA that is of a different
             # anticodon type.
             print "\."
-            for i, t1 in enumerate(t.taxon_set):
+            for i, t1 in enumerate(t.taxon_set):                
                 min2same = None
                 min2diff = None
                 closest_diff = None # taxon label of closest same-anti-codon tRNA sequence to sequence t1.
@@ -502,7 +547,7 @@ def find_anticodon_switches():
                     if thataa  == myaa: # synonymous shift
                         species_scount[species] += 1
                         fout.write("Synonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
-                        allout.write(species + "\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t" + min2diff.__str__() + "\n")                                     
+                        allout.write(species + "\tSY\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t%.4f"%min2diff + "\n")                                     
                         print "  . Syn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
                         if myac not in species_ac_scount[species]:
                             species_ac_scount[species][myac] = 1
@@ -511,6 +556,7 @@ def find_anticodon_switches():
                     elif thataa != myaa and thataa != "Met": # nonsynonymous shift
                         species_nscount[species] += 1
                         fout.write("Nonsynonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
+                        allout.write(species + "\tNS\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t%.4f"%min2diff + "\n")   
                         print "  . Nonsyn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
                         if myac not in species_ac_nscount[species]:
                             species_ac_nscount[species][myac] = 1
@@ -631,6 +677,8 @@ for d in ALLDIRS:
 #    are used in later steps.
 #
 split_and_clean_database(sys.argv[1]) # If downloaded from the tRNA database, then sys.argv[1] will be "all-trnas.fa"
+pickle_globals()
+#exit()
 """
 species_fasta = {}
 species_list = species_trna_seq.keys()
@@ -651,7 +699,6 @@ print "\n. OK, I'm parsing the results from tRNAscan. . ."
 for species in species_list:
     trnascan_to_fasta( species )
 
-
 #
 # 3. Re-align the tRNA sequences and build ML phylogenies. . .
 #
@@ -668,5 +715,6 @@ os.system("mv ./RAxML* ./" + RAXMLDIR + "/") # Move the RAxML results into the d
 #
 # 4. *** Scan the ML phylogenies for switched anti-codons. . .
 #
+#unpickle_globals()
 find_anticodon_switches()
 write_summaries()
