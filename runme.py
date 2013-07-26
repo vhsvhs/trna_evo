@@ -27,13 +27,17 @@
 #
 # 3. Invoke this script, as follows:
 #   
-#    $> python runme.py PATH
+#    $> python runme.py --dbpath PATH
 #
 #    . . . where PATH points to a fasta-formatted file containing 
 #    the database of tRNA sequences.
 #    It is important that the sequence names in this fasta file
 #    adhere to the naming convention used by the Genomic
 #    tRNA database (http://gtrnadb.ucsc.edu).
+#
+#    Optional arguments include:
+#
+#    --usempi
 #
 #    Specifically, use the following format:
 #    >Genus_species.<trna name>-AlaTGC (start-stop) Ala (TGC)
@@ -76,15 +80,22 @@ STRUCTDIR = DATADIR + "/tRNAscan_output"
 MSADIR = DATADIR + "/alignments"
 SUMMARYDIR = DATADIR + "/summaries"
 
+EUK_DB = "eukaryotic-tRNAs.fa"
+BAC_DB = "bacterial-tRNAs.fa"
+ARC_DB = "archaeal-tRNAs.fa"
+
 ALLDIRS = [LOGDIR, DATADIR, TEMPDIR, SEQDIR, RAXMLDIR, TREEDIR, STRUCTDIR, MSADIR, SUMMARYDIR]
 
 TRNASCAN = "trnascan-SE" # Points to the executable: http://selab.janelia.org/tRNAscan-SE/
 PSUEDOGENE_CUTOFF = 40
+SWITCH_DISTANCE_THRESHOLD = 0.02 # if min2same is less than this value, then it may not be a switch.
+SWITCH_DIFF_THRESHOLD = 0.01 # min2diff must be at least this much greater than min2same
+
 
 MUSCLE = "muscle"    # Points to the executable for Muscle, a program for multiple sequence alignment
 RAXML = "raxml -T 2" # Points to the exectuable for RAxML, a program for ML phylogenetic inference
 
-USE_MPI = True  # if False, then the following two variables can be ignored. . .
+USE_MPI = False  # if False, then the following two variables can be ignored. . .
 MPIRUN = "mpirun -np 29 --machinefile hosts.txt"
 MPIDISPATCH = "/common/bin/mpi_dispatch"
 
@@ -96,13 +107,21 @@ import os, sys, re
 import cPickle as pickle
 from dendropy import Tree, treecalc
 
+from argparser import *
+ap = ArgParser(sys.argv)
+
+if ap.doesContainArg("--usempi"):
+    USE_MPI = True
+
 #
 # Global data structures that will be filled with data
 # during the analysis. . .
 #
 
 #
+species_kingdom = {} # key = species, value = EUK, BAC, or ARC.
 species_trna_seq = {} # key = species, value = hashtable: key = tRNA name, value = tRNA sequence (cleaned, with anti-codon changed to NNN).  This hashtable contains only unique sequences; redundant sequences are discarded rather than added to this hashtable.
+species_trna_mtrip = {} # key = species, value = hashtable; key = trna name, value = the triplet that was masked.
 species_alltrnanames = {} # key = species, value = list of all tRNA names in the databse for this species.  Note that some tRNAs will not be in species_trna_seq because their sequences are redundant. 
 species_trna_dups = {} # [species][trna name] = a list of other tRNA names that have identical sequences to this tRNA.
 species_countreject = {} # key = species, value = count of rejected tRNAs from database.
@@ -179,6 +198,8 @@ def line_to_name(line):
     line = line.strip()
     s = re.sub(">", "", line)
     name = s.split()[0].split(".")[1]
+    if False == name.startswith("trna"):
+        name = s.split()[0].split(".")[2]        
     name = remove_problem_chars( name )
     return name
 
@@ -195,17 +216,42 @@ def get_ac_from_name(name):
     return name[ (name.__len__() )-3: ]
 
 def get_aa_from_name(name):
+    print "219:", name
     return name[ (name.__len__() )-6 : (name.__len__())-3]
 
 def is_taxa_good(taxaline):
     """This method rejects tRNA sequences, for a variety of reasons. . ."""
-    if taxaline.__contains__("chrM"): # chromosomal
+    if taxaline.__contains__("chrM"): # mitochondrial
         return  False
     if taxaline.__contains__("???"): # unknown anticodon
         return False
     if float(taxaline.split()[7]) < PSUEDOGENE_CUTOFF: # Sc score < 40, so it's probably a psuedogene.
         return False
     return True
+
+def parse_kingdoms():
+    """Initializes species_kingdom"""
+    dbs = [EUK_DB, ARC_DB, BAC_DB]
+    
+    for db in dbs:
+        if db == EUK_DB:
+            this_kingdom = "EUK"
+        elif db == ARC_DB:
+            this_kingdom = "ARC"
+        elif db == BAC_DB:
+            this_kingdom = "BAC"
+            
+        count = 0
+        fin = open(db, "r")
+        for l in fin.xreadlines():
+            if l.startswith(">"):
+                species = line_to_species(l)
+                if species not in species_kingdom:
+                    species_kingdom[species] = this_kingdom
+                    count += 1
+        fin.close()
+    
+        print "\n. OK, my reference DB has", count, "species in", this_kingdom  
 
 def split_and_clean_database(path):
     # path points to a FASTA-formatted file of tRNA sequences, with sequence name formats
@@ -253,7 +299,7 @@ def split_and_clean_database(path):
                    else:
                        break
                    j += 1
-               #print species, trna
+               #print "259:", species, trna, thisac
 
                if species not in species_alltrnanames:
                    species_alltrnanames[species] = []
@@ -261,6 +307,9 @@ def split_and_clean_database(path):
 
                if species not in species_trna_seq:
                    species_trna_seq[species] = {}
+            
+               if species not in species_trna_mtrip:
+                   species_trna_mtrip[species] = {}
 
                if species not in species_trna_dups:
                    species_trna_dups[species] = {}
@@ -270,12 +319,12 @@ def split_and_clean_database(path):
                found_dup = False
 
                for n in species_trna_seq[species]:
-                   if species_trna_seq[species][n] == seq and get_ac_from_name(n) == thisac:
+                   if species_trna_seq[species][n] == seq:# and get_ac_from_name(n) == thisac:
                        found_dup = True
                        # record the duplicate:
                        #if n not in species_trna_dups[species]:
                        #    species_trna_dups[species][n] = []
-                       #print name, "is a dup of", n
+                       #print trna, "is a dup of", n
                        species_trna_dups[species][n].append( trna )
                        break
                # If yes, save this tRNA sequence
@@ -318,7 +367,9 @@ def write_trnascan_commands(species_fasta):
     return spath
 
 def trnascan_to_fasta(species):
-    """Converts the output from tRNA-Scan-SE to a FASTA file."""
+    """Converts the output from tRNA-Scan-SE to a FASTA file.
+    This is where anticodon triplets -- or some other codon triplets -- can be masked by NNN.
+    """
     opath = STRUCTDIR + "/" + species + ".struct.txt"
     if False == os.path.exists(opath):
         return
@@ -332,13 +383,46 @@ def trnascan_to_fasta(species):
     acstop = 0
     for l in lines:
         if l.__contains__("Length:"):
-            currname = l.strip().split(".")[0]
+            currname = l.strip().split(".")[0] # grab the name of the tRNA, such as "trna24-LysCTT"
         elif l.startswith("Typ"):
-            acstart = int(l.split()[5].split("-")[0])
-            acstop = acstart + 3
+            acstart = int(l.split()[5].split("-")[0]) # grab the start site of the anticodon
+            acstop = acstart + 3 # the anticodon stop site is obviously +3
         elif l.startswith("Seq:"):
             rawseq = l.strip().split()[1]
-            editseq = rawseq[0:(acstart-1)] + "NNN" + rawseq[(acstop-1):]
+            erg_trip = "" # the original triplet before masking.
+            
+            mflag = ap.getOptionalArg("--mask") # get the user-specified masking option
+            if mflag == False:
+                mflag = "anticodon"
+            
+            if mflag == "anticodon":
+                editseq = rawseq[0:(acstart-1)] + "NNN" + rawseq[(acstop-1):]
+                erg_trip = rawseq[acstart-1:acstart+2]
+                #print "393:", currname, "erg_trip=", erg_trip
+            elif mflag == "tloop":
+                l = rawseq.__len__()
+                editseq = rawseq[0:l-20] + "NNN" + rawseq[l-17:]
+                erg_trip = rawseq[l-20:l-17]
+                #print "404:", currname, "erg_trip=", erg_trip
+            elif mflag == "dloop":
+                editseq = rawseq[0:18] + "NNN" + rawseq[21:]
+                erg_trip = rawseq[18:21]
+                #print "408:", currname, "erg_trip=", erg_trip
+            elif mflag == "r0":
+                editseq = rawseq[0] + "NNN" + rawseq[4:]
+                erg_trip = rawseq[1:4]
+            elif mflag == "r1":
+                editseq = rawseq[0:25] + "NNN" + rawseq[28:]
+                erg_trip = rawseq[25:28]
+            elif mflag == "r2":
+                editseq = rawseq[0:40] + "NNN" + rawseq[43:]
+                erg_trip = rawseq[40:43]
+            elif mflag == "r3":
+                editseq = rawseq[0:50] + "NNN" + rawseq[53:]
+                erg_trip = rawseq[50:53]
+
+            species_trna_mtrip[species][currname] = erg_trip
+            
             #print currname, "replaced", rawseq[acstart-1:acstop-1], "with NNN"
             seq = ""
             for c in editseq:
@@ -348,6 +432,9 @@ def trnascan_to_fasta(species):
             currname = None
             acstart = 0
             acstop = 0
+            
+
+            
     fout = open(STRUCTDIR + "/" + species + ".struct.fasta", "w")
     for name in name_seq:
         fout.write(">" + name + "\n")
@@ -401,15 +488,15 @@ def run_raxml():
 
 def count_trna_types(species):
     trna_count = {}
-    for trna in species_alltrnanames[species]:
-        ac = get_ac_from_name(trna)
+    for trna in species_trna_mtrip[species]:
+        ac = species_trna_mtrip[species][trna]
         if ac not in trna_count:
             trna_count[ac] = 1
         else:
             trna_count[ac] += 1
     return trna_count
 
-def pretty_print_trees():
+def pretty_print_trees():    
     print "\n. OK, I'm reformatting the RAxML results for nice printing..."
     """Reformats the phylogeny, such that each taxon label looks like this:
     trna12-AlaTCT[6/7]
@@ -430,7 +517,8 @@ def pretty_print_trees():
         newts = t.__str__()
         for taxon in t.taxon_set:
             #print "372:", taxon.label
-            thisac = get_ac_from_name(taxon.label)
+            #thisac = get_ac_from_name(taxon.label)
+            thisac = species_trna_mtrip[species][taxon.label]
             count_this_type = trna_count[thisac]
             count_dups = species_trna_dups[species][taxon.label].__len__() + 1
             if count_dups <= 1:
@@ -456,7 +544,7 @@ def debug411(species):
     print "491: verify: ns =", countns, "s=", counts, "sum=", (countns + counts)
     # end debugging
 
-def asses_monophyly(t):
+def asses_monophyly(t, species):
     """t is a DendroPy Tree."""
     """This function returns a hashtable, where key = anticodon preference X,
     value = the number of tRNAs with a.c. other than X that must be invoked to make
@@ -468,30 +556,50 @@ def asses_monophyly(t):
     # First, sort the leaf nodes by their anticodon preference.
     ac_labels = {} # key = a.c., value = list of Node objects
     for i, t1 in enumerate(t.taxon_set):
-        thisac = get_ac_from_name( t1.label )
+        #thisac = get_ac_from_name( t1.label )
+        thisac = species_trna_mtrip[species][t1.label]
         if thisac not in ac_labels:
             ac_labels[ thisac ] = []
         ac_labels[ thisac ].append( t1.label )
     
     # Next, find the MRCA for each set of a.c. nodes
+
+    fout = open(SUMMARYDIR + "/" + species + ".monophyly.txt", "w")
+    fout.write("Anticodon\tN tRNAs\tMRCA clade size\n")
     for ac in ac_labels:
-        mrca = t.mrca(taxon_labels=ac_labels[ac])
-        print ac, mrca
+        if ac_labels[ac].__len__() > 1:
+            mrca = t.mrca(taxon_labels=ac_labels[ac])
+            fout.write(ac + "\t" + ac_labels[ac].__len__().__str__() + "\t" + mrca.leaf_nodes().__len__().__str__() + "\n")
+    fout.close()
 
-    # to-do: count the number of nodes descendant from mrsa.
+def hamming_distance(s1, s2):
+    print s1.__len__(), s1
+    print s2.__len__(), s2
+    #total = 0
+    error = 0
+    for i in range(0, s1.__len__()):
+        if s1[i] != s2[i]:
+            error += 1
+        #total += 1
+    return error 
 
-def find_anticodon_switches():
+def find_anticodon_switches():    
     print "\n. OK, I'm searching for switched anticodons. . ."
     species_list = species_trna_seq.keys()
     species_list.sort()
     #print "504:", species_list
     allpath = DATADIR + "/all.acswitches.txt"
     allout = open(allpath, "w")
-    allout.write("Species\tswitch type\testimated from\tto\tto ac\tto aa\td\n")
+    allout.write("Species\tKingdom\tswitch type\tfrom\tto\td_diff\td_same\n")
     #
     # FOR EACH SPECIES. . . 
     #
     for species in species_list:
+        if species in species_kingdom:
+            this_kingdom = species_kingdom[species]
+        else:
+            this_kingdom = "???"
+        
         print species
         rpath = SUMMARYDIR + "/" + species + ".acswitches.txt"
         treepath = RAXMLDIR + "/RAxML_result." + species
@@ -506,7 +614,16 @@ def find_anticodon_switches():
             print "\n. Calculating all pairwise distances between sequences on tree:", treepath
             pdm = treecalc.PatristicDistanceMatrix(t) # matrix of pairwise distances between taxa
             
-            asses_monophyly(t)
+            asses_monophyly(t, species)
+
+            # First, sort the leaf nodes by their anticodon preference.
+            ac_labels = {} # key = a.c., value = list of Node objects
+            for i, t1 in enumerate(t.taxon_set):
+                #thisac = get_ac_from_name( t1.label )
+                thisac = species_trna_mtrip[species][t1.label]
+                if thisac not in ac_labels:
+                    ac_labels[ thisac ] = []
+                ac_labels[ thisac ].append( t1.label )
             
             #
             # FOR EACH tRNA SEQUENCE. . .
@@ -518,22 +635,27 @@ def find_anticodon_switches():
                 min2same = None
                 min2diff = None
                 closest_diff = None # taxon label of closest same-anti-codon tRNA sequence to sequence t1.
-                myac = get_ac_from_name(t1.label)
+                closest_same = None
+                #myac = get_ac_from_name(t1.label)
+                myac = species_trna_mtrip[species][t1.label]
+                print t1.label
                 myaa = get_aa_from_name(t1.label)
                 if myaa == "Met":
                     continue
                 for t2 in t.taxon_set:
                     if t1 == t2:
                         continue
-                    thisac = get_ac_from_name(t2.label)
-                    thisaa = get_aa_from_name(t2.label)
+                    #thisac = get_ac_from_name(t2.label)
+                    thisac = species_trna_mtrip[species][t2.label]
                     d = pdm(t1, t2)
                     if myac == thisac:
                         if min2same == None:
                             min2same = d
+                            closest_same = t2.label
                         elif min2same > d:
                             min2same = d
-                    elif myac != thisac:
+                            closest_same = t2.label
+                    elif myac != thisac and ac_labels[thisac].__len__() > 1:
                         if min2diff == None:
                             min2diff = d
                             closest_diff = t2.label
@@ -542,22 +664,27 @@ def find_anticodon_switches():
                             closest_diff = t2.label
                 if min2same == None:
                     min2same = 0.0 # in the event of singletons
-                if min2same > min2diff and min2diff != None: # . . . then we've identified an anticodon shift:
+                if min2diff == None:
+                    min2diff = 0.0 # in the event of sparse genomes with few tRNAs.
+                
+                if closest_diff == None:
+                    continue
+                if min2same > min2diff and min2same-min2diff > SWITCH_DIFF_THRESHOLD and min2diff != None and min2same > SWITCH_DISTANCE_THRESHOLD: # . . . then we've identified an anticodon shift:
                     thataa = get_aa_from_name(closest_diff)
                     if thataa  == myaa: # synonymous shift
                         species_scount[species] += 1
-                        fout.write("Synonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
-                        allout.write(species + "\tSY\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t%.4f"%min2diff + "\n")                                     
-                        print "  . Syn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
+                        fout.write("Synonymous" + " " + closest_diff + " -> " + t1.label + "\t" + min2diff.__str__()  + "\t" + min2same.__str__()  + "\n")
+                        allout.write(species + "\t" + this_kingdom + "\tSY\t" + closest_diff + "\t" + t1.label + "\t%.4f"%min2diff + "\t%.3f"%min2same + "\n")                                     
+                        print "  . Syn." + " " + closest_diff + " -> " + t1.label + "\t" + min2diff.__str__()  + "\t" + min2same.__str__() 
                         if myac not in species_ac_scount[species]:
                             species_ac_scount[species][myac] = 1
                         else:
                             species_ac_scount[species][myac] += 1
                     elif thataa != myaa and thataa != "Met": # nonsynonymous shift
                         species_nscount[species] += 1
-                        fout.write("Nonsynonymous" + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()  + "\n")
-                        allout.write(species + "\tNS\t" + closest_diff + "\t" + t1.label + "\t" + myac + "\t" + myac + "\t%.4f"%min2diff + "\n")   
-                        print "  . Nonsyn." + " " + closest_diff + " -> " + t1.label + " d:" + min2diff.__str__()
+                        fout.write("Nonsynonymous" + " " + closest_diff + " -> " + t1.label + "\t" + min2diff.__str__()  + "\t" + min2same.__str__() + "\n")
+                        allout.write(species + "\t" + this_kingdom + "\tNS\t" + closest_diff + "\t" + t1.label + "\t%.4f"%min2diff + "\t%.3f"%min2same + "\n")   
+                        print "  . Nonsyn." + " " + closest_diff + " -> " + t1.label + "\t" + min2diff.__str__()  + "\t" + min2same.__str__()
                         if myac not in species_ac_nscount[species]:
                             species_ac_nscount[species][myac] = 1
                         else:
@@ -577,13 +704,18 @@ def write_summaries():
     """Writes a tab-seprated text file with a summary of the numer of tRNAs in each species, and 
     the number of putative anticodon switching events."""
     fout = open(DATADIR + "/summary.species.txt", "w")
-    header = "Species\tN tRNAs\tN unique\tN rejected\ttRNAs\tN nonsyn. switches\tProportion of total\tN syn. switches\tProportion of total\n"
+    header = "Species\tKingdom\tN tRNAs\tN unique\tN rejected\ttRNAs\tN nonsyn. switches\tProportion of total\tN syn. switches\tProportion of total\n"
     fout.write(header)
 
     species_list = species_trna_seq.keys()
-    species_list.sort()
+    species_list.sort() 
     for species in species_list:
+        if species in species_kingdom:
+            this_kingdom = species_kingdom[species]
+        else:
+            this_kingdom = "???"
         line = species + "\t"
+        line += this_kingdom + "\t"
         # N tRNA in species:
         if species in species_trna_seq:
             line += species_alltrnanames[species].__len__().__str__() + "\t"
@@ -628,36 +760,36 @@ def write_summaries():
         fout.write(line + "\n")
     fout.close()
 
-    """Writes a tab-seperated file with the number of anticodon changes to each codon."""
-    all_ac = []
-    ac_s = {}
-    ac_ns = {}
-    for species in species_ac_nscount:
-        for ac in species_ac_nscount[species]:
-            if ac not in all_ac:
-                all_ac.append(ac)
-            if ac not in ac_ns:
-                ac_ns[ac] = 0
-            ac_ns[ac] += species_ac_nscount[species][ac]
-        for ac in species_ac_scount[species]:
-            if ac not in all_ac:
-                all_ac.append(ac)
-            if ac not in ac_s:
-                ac_s[ac] = 0
-            ac_s[ac] += species_ac_scount[species][ac]
-
-    fout = open(DATADIR + "/summary.codons.txt", "w")
-    fout.write("Anticodon\t N syn.\t N nonsyn.\n")
-    for ac in all_ac:
-        sstr = "0"
-        if ac in ac_s:
-            sstr = ac_s[ac].__str__()
-        nsstr = "0"
-        if ac in ac_ns:
-            nsstr = ac_ns[ac].__str__()
-        #print ac, sstr, nsstr
-        fout.write(ac + "\t" + sstr.__str__() + "\t" + nsstr.__str__() + "\n") 
-    fout.close()
+#    """Writes a tab-seperated file with the number of anticodon changes to each codon."""
+#    all_ac = []
+#    ac_s = {}
+#    ac_ns = {}
+#    for species in species_ac_nscount:
+#        for ac in species_ac_nscount[species]:
+#            if ac not in all_ac:
+#                all_ac.append(ac)
+#            if ac not in ac_ns:
+#                ac_ns[ac] = 0
+#            ac_ns[ac] += species_ac_nscount[species][ac]
+#        for ac in species_ac_scount[species]:
+#            if ac not in all_ac:
+#                all_ac.append(ac)
+#            if ac not in ac_s:
+#                ac_s[ac] = 0
+#            ac_s[ac] += species_ac_scount[species][ac]
+#
+#    fout = open(DATADIR + "/summary.codons.txt", "w")
+#    fout.write("Anticodon\t N syn.\t N nonsyn.\n")
+#    for ac in all_ac:
+#        sstr = "0"
+#        if ac in ac_s:
+#            sstr = ac_s[ac].__str__()
+#        nsstr = "0"
+#        if ac in ac_ns:
+#            nsstr = ac_ns[ac].__str__()
+#        #print ac, sstr, nsstr
+#        fout.write(ac + "\t" + sstr.__str__() + "\t" + nsstr.__str__() + "\n") 
+#    fout.close()
 
 #############################################
 #
@@ -671,50 +803,60 @@ for d in ALLDIRS:
     if os.path.exists(d) == False:
         os.system("mkdir " + d)
 
+parse_kingdoms()
+
 #
 # ** 1. Read the database, write an individual FASTA file for each species.
 #    This step is required, because it initializes global dictionaries that
 #    are used in later steps.
 #
-split_and_clean_database(sys.argv[1]) # If downloaded from the tRNA database, then sys.argv[1] will be "all-trnas.fa"
+split_and_clean_database(ap.getArg("--dbpath")) # If downloaded from the tRNA database, then sys.argv[1] will be "all-trnas.fa"
 pickle_globals()
 #exit()
-"""
 species_fasta = {}
 species_list = species_trna_seq.keys()
 species_list.sort()
 for species in species_list:
     species_fasta[species] = write_fasta_for_species(species)
 
+jumpto = float(ap.getOptionalArg("--continue"))
+if jumpto == False:
+    jumpto = 0
+
 #
 # 2. Use tRNAscan-SE to identify introns and align the tRNA sequences. . .
 #
-spath = write_trnascan_commands(species_fasta)
-print "\n. OK, I'm running tRNAscan.  This may take a while. . ."
-if USE_MPI:
-    os.system(MPIRUN + " " + MPIDISPATCH + " " + spath)
-else:
-    os.system("source " + spath)
+if jumpto <= 2:
+    spath = write_trnascan_commands(species_fasta)
+    print "\n. OK, I'm running tRNAscan.  This may take a while. . ."
+    if USE_MPI:
+        os.system(MPIRUN + " " + MPIDISPATCH + " " + spath)
+    else:
+        os.system("source " + spath)
+
 print "\n. OK, I'm parsing the results from tRNAscan. . ."
 for species in species_list:
     trnascan_to_fasta( species )
-
 #
 # 3. Re-align the tRNA sequences and build ML phylogenies. . .
 #
-print "\n. OK, I'm aligning the tRNA sequences. . ."
-run_muscle()
-run_raxml()
-os.system("mv ./RAxML* ./" + RAXMLDIR + "/") # Move the RAxML results into the data folder
-"""
+if jumpto <= 3:
+    print "\n. OK, I'm aligning the tRNA sequences. . ."
+    run_muscle()
+if jumpto <= 3.1:
+    run_raxml()
+
+if jumpto <= 3.2:
+    os.system("mv ./RAxML* ./" + RAXMLDIR + "/") # Move the RAxML results into the data folder
 
 # 3b. Reformat the RAxML phylogeny for printing. . .
-#pretty_print_trees()
+if jumpto <= 3.3:
+    pretty_print_trees()
 #exit()
-
 #
 # 4. *** Scan the ML phylogenies for switched anti-codons. . .
 #
-#unpickle_globals()
-find_anticodon_switches()
-write_summaries()
+if jumpto <= 4:
+    #unpickle_globals()
+    find_anticodon_switches()
+    write_summaries()
