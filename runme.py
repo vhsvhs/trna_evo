@@ -129,12 +129,12 @@ species_nscount = {} # key = species, value = count of putative nonsynonymous an
 species_scount = {} # key = species, value = count of putative synonymous anticodon-switching events.
 species_ac_nscount = {} # key = species, value = hash; key = codon, value = count of anticodon shifts to this codon
 species_ac_scount = {} # same as species_ac_nscount, but count nonsynonymous anticodon shifts only.
-ac_count = {} # key = anticodon, value = count of tRNAs among all species.
+species_switchedtrnas = {}
 
 ##################################
 
 def pickle_globals():
-    p = [species_trna_seq, species_alltrnanames, species_trna_dups, species_countreject, species_nscount, species_scount, species_ac_nscount, species_ac_scount, ac_count]
+    p = [species_trna_seq, species_alltrnanames, species_trna_dups, species_countreject, species_nscount, species_scount, species_ac_nscount, species_ac_scount]
     pickle.dump( p, open( TEMPDIR + "/save.p", "w" ) )
     
 def unpickle_globals():
@@ -147,7 +147,6 @@ def unpickle_globals():
     species_scount = p[5]
     species_ac_nscount = p[6]
     species_ac_scount = p[7]
-    ac_count = p[8]
 
 def remove_problem_chars(x):
     #print x
@@ -287,10 +286,6 @@ def split_and_clean_database(path):
                    continue
                trna = line_to_name(line)
                thisac = line_to_anticodon(line)
-               if thisac in ac_count:
-                   ac_count[thisac] += 1
-               else:
-                   ac_count[thisac] = 1
                seq = ""
                j = i+1
                while (j < lines.__len__()):
@@ -520,13 +515,21 @@ def pretty_print_trees():
             #thisac = get_ac_from_name(taxon.label)
             thisac = species_trna_mtrip[species][taxon.label]
             count_this_type = trna_count[thisac]
-            count_dups = species_trna_dups[species][taxon.label].__len__() + 1
+            count_dups = 0
+            if taxon.label in species_trna_dups[species]:
+                count_dups = species_trna_dups[species][taxon.label].__len__() + 1
             if count_dups <= 1:
                 count_dups = ""
             else:
                 count_dups = "(" + count_dups.__str__() + ")"
 
-            newts = re.sub( taxon.label, (taxon.label + count_dups + "[" + count_this_type.__str__()+ "]"), newts)
+            mark = ""
+            if species in species_switchedtrnas:
+                print "534:", species_switchedtrnas[species]
+                if species_switchedtrnas[species].__contains__(taxon.label):
+                    mark = "***"
+
+            newts = re.sub( taxon.label, (taxon.label + count_dups + "[" + count_this_type.__str__()+ "]" + mark), newts)
         fout = open(newtreepath, "w")
         fout.write( newts + "\n" )
         fout.close()
@@ -599,7 +602,7 @@ def find_anticodon_switches():
             this_kingdom = species_kingdom[species]
         else:
             this_kingdom = "???"
-        
+                
         print species
         rpath = SUMMARYDIR + "/" + species + ".acswitches.txt"
         treepath = RAXMLDIR + "/RAxML_result." + species
@@ -638,7 +641,10 @@ def find_anticodon_switches():
                 closest_same = None
                 #myac = get_ac_from_name(t1.label)
                 myac = species_trna_mtrip[species][t1.label]
-                print t1.label
+                #print t1.label
+                if ac_labels[myac].__len__() <= 1:
+                    continue # skip tRNAs for which they are the only representative of their AC.
+                ac_labels[myac].remove( t1.label )
                 myaa = get_aa_from_name(t1.label)
                 if myaa == "Met":
                     continue
@@ -669,7 +675,13 @@ def find_anticodon_switches():
                 
                 if closest_diff == None:
                     continue
-                if min2same > min2diff and min2same-min2diff > SWITCH_DIFF_THRESHOLD and min2diff != None and min2same > SWITCH_DISTANCE_THRESHOLD: # . . . then we've identified an anticodon shift:
+                if min2same > min2diff and min2same-min2diff > SWITCH_DIFF_THRESHOLD and min2diff != None and min2same > SWITCH_DISTANCE_THRESHOLD: 
+                    # . . . then we've identified an anticodon shift:
+                    if species not in species_switchedtrnas:
+                        species_switchedtrnas[species] = []
+                    if t1.label not in species_switchedtrnas[species]:
+                        species_switchedtrnas[species].append( t1.label )
+                    
                     thataa = get_aa_from_name(closest_diff)
                     if thataa  == myaa: # synonymous shift
                         species_scount[species] += 1
@@ -849,9 +861,6 @@ if jumpto <= 3.1:
 if jumpto <= 3.2:
     os.system("mv ./RAxML* ./" + RAXMLDIR + "/") # Move the RAxML results into the data folder
 
-# 3b. Reformat the RAxML phylogeny for printing. . .
-if jumpto <= 3.3:
-    pretty_print_trees()
 #exit()
 #
 # 4. *** Scan the ML phylogenies for switched anti-codons. . .
@@ -860,3 +869,7 @@ if jumpto <= 4:
     #unpickle_globals()
     find_anticodon_switches()
     write_summaries()
+    
+# 3b. Reformat the RAxML phylogeny for printing. . .
+if jumpto <= 4.1:
+    pretty_print_trees()
